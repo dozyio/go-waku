@@ -1,4 +1,4 @@
-package waku
+package main
 
 import (
 	"context"
@@ -17,6 +17,8 @@ import (
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/pbnjay/memory"
 
+	"github.com/waku-org/go-waku/waku/persistence/sqlite"
+	dbutils "github.com/waku-org/go-waku/waku/persistence/utils"
 	wmetrics "github.com/waku-org/go-waku/waku/v2/metrics"
 	"github.com/waku-org/go-waku/waku/v2/peers"
 	"github.com/waku-org/go-waku/waku/v2/rendezvous"
@@ -43,7 +45,6 @@ import (
 	"github.com/waku-org/go-waku/logging"
 	"github.com/waku-org/go-waku/waku/metrics"
 	"github.com/waku-org/go-waku/waku/persistence"
-	"github.com/waku-org/go-waku/waku/persistence/sqlite"
 	"github.com/waku-org/go-waku/waku/v2/dnsdisc"
 	"github.com/waku-org/go-waku/waku/v2/node"
 	"github.com/waku-org/go-waku/waku/v2/protocol/filter"
@@ -104,7 +105,7 @@ func Execute(options Options) {
 	var db *sql.DB
 	var migrationFn func(*sql.DB) error
 	if requiresDB(options) {
-		db, migrationFn, err = ExtractDBAndMigration(options.Store.DatabaseURL)
+		db, migrationFn, err = dbutils.ExtractDBAndMigration(options.Store.DatabaseURL)
 		failOnErr(err, "Could not connect to DB")
 	}
 
@@ -141,8 +142,8 @@ func Execute(options Options) {
 		nodeOpts = append(nodeOpts, node.WithExternalIP(ip))
 	}
 
-	if options.Dns4DomainName != "" {
-		nodeOpts = append(nodeOpts, node.WithDns4Domain(options.Dns4DomainName))
+	if options.DNS4DomainName != "" {
+		nodeOpts = append(nodeOpts, node.WithDns4Domain(options.DNS4DomainName))
 	}
 
 	libp2pOpts := node.DefaultLibP2POptions
@@ -227,7 +228,7 @@ func Execute(options Options) {
 	}
 
 	if options.Store.Enable {
-		nodeOpts = append(nodeOpts, node.WithWakuStore(options.Store.ResumeNodes...))
+		nodeOpts = append(nodeOpts, node.WithWakuStore())
 		nodeOpts = append(nodeOpts, node.WithMessageProvider(dbStore))
 	}
 
@@ -314,27 +315,6 @@ func Execute(options Options) {
 	addStaticPeers(wakuNode, options.Rendezvous.Nodes, rendezvous.RendezvousID)
 	addStaticPeers(wakuNode, options.Filter.Nodes, filter.FilterSubscribeID_v20beta1)
 
-	if options.DiscV5.Enable {
-		if err = wakuNode.DiscV5().Start(ctx); err != nil {
-			logger.Fatal("starting discovery v5", zap.Error(err))
-		}
-	}
-
-	// retrieve and connect to peer exchange peers
-	if options.PeerExchange.Enable && options.PeerExchange.Node != nil {
-		logger.Info("retrieving peer info via peer exchange protocol")
-
-		peerId, err := wakuNode.AddPeer(*options.PeerExchange.Node, peers.Static, peer_exchange.PeerExchangeID_v20alpha1)
-		if err != nil {
-			logger.Error("adding peer exchange peer", logging.MultiAddrs("node", *options.PeerExchange.Node), zap.Error(err))
-		} else {
-			desiredOutDegree := wakuNode.Relay().Params().D
-			if err = wakuNode.PeerExchange().Request(ctx, desiredOutDegree, peer_exchange.WithPeer(peerId)); err != nil {
-				logger.Error("requesting peers via peer exchange", zap.Error(err))
-			}
-		}
-	}
-
 	if len(options.Relay.Topics.Value()) == 0 {
 		options.Relay.Topics = *cli.NewStringSlice(relay.DefaultWakuTopic)
 	}
@@ -398,6 +378,27 @@ func Execute(options Options) {
 		}(ctx, n)
 	}
 
+	if options.DiscV5.Enable {
+		if err = wakuNode.DiscV5().Start(ctx); err != nil {
+			logger.Fatal("starting discovery v5", zap.Error(err))
+		}
+	}
+
+	// retrieve and connect to peer exchange peers
+	if options.PeerExchange.Enable && options.PeerExchange.Node != nil {
+		logger.Info("retrieving peer info via peer exchange protocol")
+
+		peerID, err := wakuNode.AddPeer(*options.PeerExchange.Node, peers.Static, peer_exchange.PeerExchangeID_v20alpha1)
+		if err != nil {
+			logger.Error("adding peer exchange peer", logging.MultiAddrs("node", *options.PeerExchange.Node), zap.Error(err))
+		} else {
+			desiredOutDegree := wakuNode.Relay().Params().D
+			if err = wakuNode.PeerExchange().Request(ctx, desiredOutDegree, peer_exchange.WithPeer(peerID)); err != nil {
+				logger.Error("requesting peers via peer exchange", zap.Error(err))
+			}
+		}
+	}
+
 	if len(discoveredNodes) != 0 {
 		for _, n := range discoveredNodes {
 			go func(ctx context.Context, info peer.AddrInfo) {
@@ -412,13 +413,39 @@ func Execute(options Options) {
 		}
 	}
 
+	var wg sync.WaitGroup
+
+	if options.Store.Enable && len(options.Store.ResumeNodes) != 0 {
+		// TODO: extract this to a function and run it when you go offline
+		// TODO: determine if a store is listening to a topic
+
+		var peerIDs []peer.ID
+		for _, n := range options.Store.ResumeNodes {
+			pID, err := wakuNode.AddPeer(n, peers.Static, store.StoreID_v20beta4)
+			if err != nil {
+				logger.Warn("adding peer to peerstore", logging.MultiAddrs("peer", n), zap.Error(err))
+			}
+			peerIDs = append(peerIDs, pID)
+		}
+
+		for _, t := range options.Relay.Topics.Value() {
+			wg.Add(1)
+			go func(topic string) {
+				defer wg.Done()
+				ctxWithTimeout, ctxCancel := context.WithTimeout(ctx, 20*time.Second)
+				defer ctxCancel()
+				if _, err := wakuNode.Store().Resume(ctxWithTimeout, topic, peerIDs); err != nil {
+					logger.Error("Could not resume history", zap.Error(err))
+				}
+			}(t)
+		}
+	}
+
 	var rpcServer *rpc.WakuRpc
 	if options.RPCServer.Enable {
 		rpcServer = rpc.NewWakuRpc(wakuNode, options.RPCServer.Address, options.RPCServer.Port, options.RPCServer.Admin, options.RPCServer.Private, options.PProf, options.RPCServer.RelayCacheCapacity, logger)
 		rpcServer.Start()
 	}
-
-	var wg sync.WaitGroup
 
 	var restServer *rest.WakuRest
 	if options.RESTServer.Enable {
@@ -589,10 +616,9 @@ func printListeningAddresses(ctx context.Context, nodeOpts []node.WakuNodeOption
 		panic(err)
 	}
 
-	hostInfo, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s", h.ID().Pretty()))
-
-	for _, addr := range h.Addrs() {
-		fmt.Println(addr.Encapsulate(hostInfo))
+	hostAddrs := utils.EncapsulatePeerID(h.ID(), h.Addrs()...)
+	for _, addr := range hostAddrs {
+		fmt.Println(addr)
 	}
 
 }

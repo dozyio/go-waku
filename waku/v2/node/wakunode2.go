@@ -2,8 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"math/rand"
 	"net"
 	"sync"
@@ -32,7 +30,6 @@ import (
 	"go.opencensus.io/stats"
 
 	"github.com/waku-org/go-waku/logging"
-	"github.com/waku-org/go-waku/waku/try"
 	v2 "github.com/waku-org/go-waku/waku/v2"
 	"github.com/waku-org/go-waku/waku/v2/discv5"
 	"github.com/waku-org/go-waku/waku/v2/metrics"
@@ -50,6 +47,8 @@ import (
 
 	"github.com/waku-org/go-waku/waku/v2/utils"
 )
+
+const discoveryConnectTimeout = 20 * time.Second
 
 type Peer struct {
 	ID        peer.ID        `json:"peerID"`
@@ -82,11 +81,11 @@ type WakuNode struct {
 	log        *zap.Logger
 	timesource timesource.Timesource
 
-	peerstore peerstore.Peerstore
+	peerstore     peerstore.Peerstore
+	peerConnector *v2.PeerConnectionStrategy
 
 	relay           Service
 	lightPush       Service
-	peerConnector   PeerConnectorService
 	discoveryV5     Service
 	peerExchange    Service
 	rendezvous      Service
@@ -246,9 +245,9 @@ func New(opts ...WakuNodeOption) (*WakuNode, error) {
 	// Setup peer connection strategy
 	cacheSize := 600
 	rngSrc := rand.NewSource(rand.Int63())
-	minBackoff, maxBackoff := time.Second*30, time.Hour
+	minBackoff, maxBackoff := time.Minute, time.Hour
 	bkf := backoff.NewExponentialBackoff(minBackoff, maxBackoff, backoff.FullJitter, time.Second, 5.0, 0, rand.New(rngSrc))
-	w.peerConnector, err = v2.NewPeerConnectionStrategy(cacheSize, w.opts.discoveryMinPeers, network.DialPeerTimeout, bkf, w.log)
+	w.peerConnector, err = v2.NewPeerConnectionStrategy(cacheSize, w.opts.discoveryMinPeers, discoveryConnectTimeout, bkf, w.log)
 	if err != nil {
 		w.log.Error("creating peer connection strategy", zap.Error(err))
 	}
@@ -336,9 +335,10 @@ func (w *WakuNode) Start(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
-	w.opts.libP2POpts = append(w.opts.libP2POpts, libp2p.ConnectionGater(connGater))
 
-	host, err := libp2p.New(w.opts.libP2POpts...)
+	libP2POpts := append(w.opts.libP2POpts, libp2p.ConnectionGater(connGater))
+
+	host, err := libp2p.New(libP2POpts...)
 	if err != nil {
 		return err
 	}
@@ -402,14 +402,6 @@ func (w *WakuNode) Start(ctx context.Context) error {
 		err := w.relay.Start(ctx)
 		if err != nil {
 			return err
-		}
-
-		if !w.opts.noDefaultWakuTopic {
-			sub, err := w.Relay().Subscribe(ctx)
-			if err != nil {
-				return err
-			}
-			sub.Unsubscribe()
 		}
 	}
 
@@ -572,12 +564,7 @@ func (w *WakuNode) watchENRChanges(ctx context.Context) {
 
 // ListenAddresses returns all the multiaddresses used by the host
 func (w *WakuNode) ListenAddresses() []ma.Multiaddr {
-	hostInfo, _ := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", w.host.ID().Pretty()))
-	var result []ma.Multiaddr
-	for _, addr := range w.host.Addrs() {
-		result = append(result, addr.Encapsulate(hostInfo))
-	}
-	return result
+	return utils.EncapsulatePeerID(w.host.ID(), w.host.Addrs()...)
 }
 
 // ENR returns the ENR address of the node
@@ -666,34 +653,6 @@ func (w *WakuNode) Broadcaster() relay.Broadcaster {
 	return w.bcaster
 }
 
-// Publish will attempt to publish a message via WakuRelay if there are enough
-// peers available, otherwise it will attempt to publish via Lightpush protocol
-func (w *WakuNode) Publish(ctx context.Context, msg *pb.WakuMessage) error {
-	if !w.opts.enableLightPush && !w.opts.enableRelay {
-		return errors.New("cannot publish message, relay and lightpush are disabled")
-	}
-
-	hash := msg.Hash(relay.DefaultWakuTopic)
-	err := try.Do(func(attempt int) (bool, error) {
-		var err error
-
-		relay := w.Relay()
-		lightpush := w.Lightpush()
-
-		if relay == nil || !relay.EnoughPeersToPublish() {
-			w.log.Debug("publishing message via lightpush", logging.HexBytes("hash", hash))
-			_, err = lightpush.Publish(ctx, msg)
-		} else {
-			w.log.Debug("publishing message via relay", logging.HexBytes("hash", hash))
-			_, err = relay.Publish(ctx, msg)
-		}
-
-		return attempt < maxPublishAttempt, err
-	})
-
-	return err
-}
-
 func (w *WakuNode) mountDiscV5() error {
 	discV5Options := []discv5.DiscoveryV5Option{
 		discv5.WithBootnodes(w.opts.discV5bootnodes),
@@ -718,33 +677,6 @@ func (w *WakuNode) startStore(ctx context.Context, sub relay.Subscription) error
 		return err
 	}
 
-	if len(w.opts.resumeNodes) != 0 {
-		// TODO: extract this to a function and run it when you go offline
-		// TODO: determine if a store is listening to a topic
-
-		var peerIDs []peer.ID
-		for _, n := range w.opts.resumeNodes {
-			pID, err := w.AddPeer(n, peers.Static, store.StoreID_v20beta4)
-			if err != nil {
-				w.log.Warn("adding peer to peerstore", logging.MultiAddrs("peer", n), zap.Error(err))
-			}
-			peerIDs = append(peerIDs, pID)
-		}
-
-		if !w.opts.noDefaultWakuTopic {
-			w.wg.Add(1)
-			go func() {
-				defer w.wg.Done()
-
-				ctxWithTimeout, ctxCancel := context.WithTimeout(ctx, 20*time.Second)
-				defer ctxCancel()
-				if _, err := w.store.(store.Store).Resume(ctxWithTimeout, string(relay.DefaultWakuTopic), peerIDs); err != nil {
-					w.log.Error("Could not resume history", zap.Error(err))
-					time.Sleep(10 * time.Second)
-				}
-			}()
-		}
-	}
 	return nil
 }
 
@@ -881,7 +813,7 @@ func (w *WakuNode) Peers() ([]*Peer, error) {
 			return nil, err
 		}
 
-		addrs := w.host.Peerstore().Addrs(peerId)
+		addrs := utils.EncapsulatePeerID(peerId, w.host.Peerstore().Addrs(peerId)...)
 		peers = append(peers, &Peer{
 			ID:        peerId,
 			Protocols: protocols,

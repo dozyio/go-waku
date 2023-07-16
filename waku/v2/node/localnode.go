@@ -9,7 +9,9 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
 	ma "github.com/multiformats/go-multiaddr"
+	"github.com/waku-org/go-waku/waku/v2/protocol"
 	wenr "github.com/waku-org/go-waku/waku/v2/protocol/enr"
+	"github.com/waku-org/go-waku/waku/v2/protocol/relay"
 	"go.uber.org/zap"
 )
 
@@ -55,6 +57,8 @@ func (w *WakuNode) updateLocalNode(localnode *enode.LocalNode, multiaddrs []ma.M
 			localnode.Delete(enr.TCP6(0))
 		}
 	}
+
+	localnode.SetFallbackIP(net.IP{127, 0, 0, 1})
 
 	return wenr.Update(localnode, options...)
 }
@@ -268,6 +272,75 @@ func (w *WakuNode) setupENR(ctx context.Context, addrs []ma.Multiaddr) error {
 		w.log.Error("updating localnode ENR record", zap.Error(err))
 		return err
 	}
+
+	if w.Relay() != nil {
+		err = w.watchTopicShards(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+
+}
+
+func (w *WakuNode) watchTopicShards(ctx context.Context) error {
+	evtRelaySubscribed, err := w.Relay().Events().Subscribe(new(relay.EvtRelaySubscribed))
+	if err != nil {
+		return err
+	}
+
+	evtRelayUnsubscribed, err := w.Relay().Events().Subscribe(new(relay.EvtRelayUnsubscribed))
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		defer evtRelaySubscribed.Close()
+		defer evtRelayUnsubscribed.Close()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-evtRelayUnsubscribed.Out():
+			case <-evtRelaySubscribed.Out():
+				topics := w.Relay().Topics()
+				rs, err := protocol.TopicsToRelayShards(topics...)
+				if err != nil {
+					w.log.Warn("could not set ENR shard info", zap.Error(err))
+					continue
+				}
+
+				if len(rs) > 0 {
+					if len(rs) > 1 {
+						w.log.Warn("could not set ENR shard info", zap.String("error", "use sharded topics within the same cluster"))
+						continue
+					}
+
+					tcount := 0
+					for _, r := range rs {
+						tcount += len(r.Indices)
+					}
+					if tcount != len(topics) {
+						w.log.Warn("could not set ENR shard info", zap.String("error", "can't use a mix of static shards and named shards"))
+						continue
+					}
+				}
+
+				if len(rs) == 1 {
+					w.log.Info("updating advertised relay shards in ENR")
+					err = wenr.Update(w.localNode, wenr.WithWakuRelaySharding(rs[0]))
+					if err != nil {
+						w.log.Warn("could not set ENR shard info", zap.Error(err))
+						continue
+					}
+
+					w.enrChangeCh <- struct{}{}
+				}
+			}
+		}
+	}()
 
 	return nil
 }

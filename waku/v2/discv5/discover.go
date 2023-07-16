@@ -28,14 +28,20 @@ import (
 
 var ErrNoDiscV5Listener = errors.New("no discv5 listener")
 
+type PeerConnector interface {
+	Subscribe(context.Context, <-chan v2.PeerData)
+}
+
 type DiscoveryV5 struct {
-	params        *discV5Parameters
-	host          host.Host
-	config        discover.Config
-	udpAddr       *net.UDPAddr
-	listener      *discover.UDPv5
-	localnode     *enode.LocalNode
+	params    *discV5Parameters
+	host      host.Host
+	config    discover.Config
+	udpAddr   *net.UDPAddr
+	listener  *discover.UDPv5
+	localnode *enode.LocalNode
+
 	peerConnector PeerConnector
+	peerCh        chan v2.PeerData
 	NAT           nat.Interface
 
 	log *zap.Logger
@@ -57,6 +63,10 @@ type discV5Parameters struct {
 type DiscoveryV5Option func(*discV5Parameters)
 
 var protocolID = [6]byte{'d', '5', 'w', 'a', 'k', 'u'}
+
+const peerDelay = 100 * time.Millisecond
+const bucketSize = 16
+const delayBetweenDiscoveredPeerCnt = 5 * time.Second
 
 func WithAutoUpdate(autoUpdate bool) DiscoveryV5Option {
 	return func(params *discV5Parameters) {
@@ -101,10 +111,6 @@ func DefaultOptions() []DiscoveryV5Option {
 	}
 }
 
-type PeerConnector interface {
-	PeerChannel() chan<- v2.PeerData
-}
-
 func NewDiscoveryV5(priv *ecdsa.PrivateKey, localnode *enode.LocalNode, peerConnector PeerConnector, log *zap.Logger, opts ...DiscoveryV5Option) (*DiscoveryV5, error) {
 	params := new(discV5Parameters)
 	optList := DefaultOptions()
@@ -121,8 +127,8 @@ func NewDiscoveryV5(priv *ecdsa.PrivateKey, localnode *enode.LocalNode, peerConn
 	}
 
 	return &DiscoveryV5{
-		peerConnector: peerConnector,
 		params:        params,
+		peerConnector: peerConnector,
 		NAT:           NAT,
 		wg:            &sync.WaitGroup{},
 		localnode:     localnode,
@@ -195,6 +201,9 @@ func (d *DiscoveryV5) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancel = cancel
 
+	d.peerCh = make(chan v2.PeerData)
+	d.peerConnector.Subscribe(ctx, d.peerCh)
+
 	err := d.listen(ctx)
 	if err != nil {
 		return err
@@ -225,6 +234,7 @@ func (d *DiscoveryV5) Stop() {
 	if !d.started.CompareAndSwap(true, false) { // if Discoveryv5 is running, set started to false
 		return
 	}
+
 	d.cancel()
 
 	if d.listener != nil {
@@ -234,6 +244,8 @@ func (d *DiscoveryV5) Stop() {
 	}
 
 	d.wg.Wait()
+
+	close(d.peerCh)
 }
 
 /*
@@ -325,7 +337,25 @@ func (d *DiscoveryV5) FindPeersWithShard(ctx context.Context, cluster, index uin
 func (d *DiscoveryV5) Iterate(ctx context.Context, iterator enode.Iterator, onNode func(*enode.Node, peer.AddrInfo) error) {
 	defer iterator.Close()
 
-	for iterator.Next() { // while next exists, run for loop
+	peerCnt := 0
+	for {
+
+		if !delayedHasNext(ctx, iterator) {
+			return
+		}
+
+		peerCnt++
+		if peerCnt == bucketSize { // Delay every bucketSize peers discovered
+			peerCnt = 0
+			t := time.NewTimer(delayBetweenDiscoveredPeerCnt)
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				t.Stop()
+			}
+		}
+
 		_, addresses, err := enr.Multiaddress(iterator.Node())
 		if err != nil {
 			metrics.RecordDiscV5Error(context.Background(), "peer_info_failure")
@@ -355,6 +385,28 @@ func (d *DiscoveryV5) Iterate(ctx context.Context, iterator enode.Iterator, onNo
 	}
 }
 
+func delayedHasNext(ctx context.Context, iterator enode.Iterator) bool {
+	// Delay if .Next() is too fast
+	start := time.Now()
+	hasNext := iterator.Next()
+	if !hasNext {
+		return false
+	}
+
+	elapsed := time.Since(start)
+	if elapsed < peerDelay {
+		t := time.NewTimer(peerDelay - elapsed)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			t.Stop()
+		}
+	}
+
+	return true
+}
+
 // Iterates over the nodes found via discv5 belonging to the node's current shard, and sends them to peerConnector
 func (d *DiscoveryV5) peerLoop(ctx context.Context) error {
 	iterator, err := d.Iterator()
@@ -373,7 +425,7 @@ func (d *DiscoveryV5) peerLoop(ctx context.Context) error {
 			return true
 		}
 
-		nodeRS, err := enr.RelaySharding(d.localnode.Node().Record())
+		nodeRS, err := enr.RelaySharding(n.Record())
 		if err != nil || nodeRS == nil {
 			return false
 		}
@@ -383,7 +435,7 @@ func (d *DiscoveryV5) peerLoop(ctx context.Context) error {
 		}
 
 		// Contains any
-		for _, idx := range nodeRS.Indices {
+		for _, idx := range localRS.Indices {
 			if nodeRS.Contains(localRS.Cluster, idx) {
 				return true
 			}
@@ -402,7 +454,7 @@ func (d *DiscoveryV5) peerLoop(ctx context.Context) error {
 		}
 
 		select {
-		case d.peerConnector.PeerChannel() <- peer:
+		case d.peerCh <- peer:
 		case <-ctx.Done():
 			return nil
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 )
 
 const MaxShardIndex = uint16(1023)
@@ -53,8 +54,8 @@ func (rs RelayShards) Contains(cluster uint16, index uint16) bool {
 	}
 
 	found := false
-	for _, i := range rs.Indices {
-		if i == index {
+	for _, idx := range rs.Indices {
+		if idx == index {
 			found = true
 		}
 	}
@@ -76,6 +77,10 @@ func TopicsToRelayShards(topic ...string) ([]RelayShards, error) {
 	result := make([]RelayShards, 0)
 	dict := make(map[uint16]map[uint16]struct{})
 	for _, t := range topic {
+		if !strings.HasPrefix(t, StaticShardingPubsubTopicPrefix) {
+			continue
+		}
+
 		var ps StaticShardingPubsubTopic
 		err := ps.Parse(t)
 		if err != nil {
